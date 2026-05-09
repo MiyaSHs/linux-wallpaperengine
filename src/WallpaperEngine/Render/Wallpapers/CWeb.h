@@ -34,7 +34,23 @@ public:
 
     [[nodiscard]] int getHeight () const override { return this->m_height; }
 
+    /**
+     * Wait an extra fixed window before capturing CEF wallpapers. CEF's first paint is
+     * delivered asynchronously after a chain of subprocess + page-load events, so a flat
+     * frame budget is more reliable than trying to detect the first paint signal itself.
+     * 180 frames ≈ 3 s at 60 fps / 6 s at 30 fps — generous enough for a web page with
+     * fonts/scripts to complete its first render but not so long that the screenshot
+     * pipeline noticeably stalls.
+     */
+    [[nodiscard]] uint32_t getExtraScreenshotDelayFrames () const override { return 180; }
+
     void setSize (int width, int height);
+
+    /** Called by RenderHandler::OnPaint when CEF delivers its first painted frame. */
+    void markPainted () { this->m_hasPainted = true; }
+
+    /** Whether CEF has delivered at least one painted frame. Exposed for diagnostics. */
+    [[nodiscard]] bool hasPainted () const { return this->m_hasPainted; }
 
 protected:
     void renderFrame (const glm::ivec4& viewport) override;
@@ -51,6 +67,7 @@ private:
 
     int m_width = 16;
     int m_height = 17;
+    bool m_hasPainted = false;
 
     WallpaperEngine::Input::MouseClickStatus m_leftClick = Input::Released;
     WallpaperEngine::Input::MouseClickStatus m_rightClick = Input::Released;

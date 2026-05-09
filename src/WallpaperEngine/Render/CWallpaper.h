@@ -103,6 +103,22 @@ public:
     [[nodiscard]] std::shared_ptr<const CFBO> getFBO () const;
 
     /**
+     * @return True if the wallpaper has produced at least one frame's worth of valid output
+     *         in its FBO. Used by the screenshot path to avoid capturing a still-cleared FBO
+     *         (e.g. video wallpapers whose MPV/Vulkan decoder hasn't finished initializing).
+     *         Default implementation returns true (synchronous wallpapers are always ready).
+     */
+    [[nodiscard]] virtual bool isReadyForScreenshot () const { return true; }
+
+    /**
+     * @return Extra frames the screenshot code should wait beyond the normal screenshot delay
+     *         before capturing this wallpaper. Applied unconditionally — a flat time gate that
+     *         doesn't depend on any "ready" signal. Useful for CEF web wallpapers, whose paint
+     *         lifecycle is async and detecting "first paint" reliably is hard. Default: 0.
+     */
+    [[nodiscard]] virtual uint32_t getExtraScreenshotDelayFrames () const { return 0; }
+
+    /**
      * Updates the UVs coordinates if window/screen/vflip/projection has changed
      */
     void updateUVs (const glm::ivec4& viewport, const bool vflip);

@@ -180,10 +180,13 @@ Render::CObject* CScene::createObject (const Object& object) {
 	});
 
 	if (dep == this->getScene ().objects.end ()) {
-	    sLog.exception ("Cannot find parent ", parentId, " for object ", object.id);
+	    // The parent likely failed to parse earlier (e.g. unsupported Text type, scripted
+	    // value with unimplemented globals). Don't abort the whole wallpaper — render the
+	    // child without parent-relative transforms.
+	    sLog.error ("Cannot find parent ", parentId, " for object ", object.id, ", rendering parentless");
+	} else {
+	    this->createObject (**dep);
 	}
-
-	this->createObject (**dep);
     }
 
     if (object.is<Image> ()) {

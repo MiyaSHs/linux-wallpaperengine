@@ -2,7 +2,12 @@
 
 #include "CRenderable.h"
 
+#include <functional>
 #include <sstream>
+
+// Render-time clock — shared with CScene/CParticle. Declared in main.cpp.
+extern float g_Time;
+extern float g_TimeLast;
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -32,10 +37,40 @@ CImage::CImage (Wallpapers::CScene& scene, const Image& image) :
     glm::vec2 size = this->getSize ();
     glm::vec3 scale = this->getImage ().scale->value->getVec3 ();
 
-    // TODO: PROPERLY SUPPORT PARENTS, FOR NOW THIS SHOULD BE ENOUGH
-    if (this->m_image.parent.has_value ()) {
-	origin += this->getScene ().getObject (this->m_image.parent.value ())->getObject ().origin->value->getVec3 ();
-    }
+    // Walk the parent chain accumulating each ancestor's stored origin. WPE wallpapers
+    // can nest parents several levels deep — e.g. 3219908811 has head→torso→hairstyle
+    // where only the topmost ancestor stores a non-zero origin and the intermediate
+    // links exist purely for grouping. Reading just the immediate parent's origin
+    // would leave the head at (0,0,0). Bound the walk to guard against pathological
+    // cycles in malformed scene.json.
+    auto walkParentChain = [&] (std::optional<int> from) -> glm::vec3 {
+	glm::vec3 acc (0.0f);
+	auto cur = from;
+	int hops = 0;
+	while (cur.has_value () && hops++ < 32) {
+	    const auto& ancestor = this->getScene ().getObject (cur.value ())->getObject ();
+	    acc += ancestor.origin->value->getVec3 ();
+	    cur = ancestor.parent;
+	}
+	return acc;
+    };
+    origin += walkParentChain (this->m_image.parent);
+
+    // NOTE: WPE puppets expose named MDAT attachment points (e.g. "头" on the body
+    // puppet of 3363252053) with a `bone_index` and a 4x4 transform offset from
+    // that bone. A child image with `attachment: <name>` should follow that
+    // bone+offset position as the parent animates. Both `boneIndex` and the
+    // attachment matrix are now parsed and stored in m_puppetMdl, but the exact
+    // formula composing them with the child image's `origin` field is not yet
+    // verified — naive interpretations (bone-world * attachment-local + parent
+    // origin) produce visually wrong placements. Leaving this disabled until I
+    // can correlate against a concrete WPE-rendered reference.
+
+    // Note: model->cropoffset is editor-only metadata. The WPE editor's
+    // "Align with background" context-menu button calls `centerRenderable(id,
+    // cropoffset)` which updates the image's origin to put visible content at
+    // canvas center; the cropoffset value itself is not applied at runtime.
+    // We deliberately do NOT add it to origin here.
 
     this->detectTexture ();
 
@@ -224,6 +259,15 @@ CImage::CImage (Wallpapers::CScene& scene, const Image& image) :
     // ensure the input texture is marked as used
     // this makes video playback start if it's not already
     this->m_texture->incrementUsageCount ();
+
+    // If this image declares a puppet, parse the .mdl and prepare GPU buffers for skinned
+    // rendering. On any failure we just don't set m_isPuppet — the image falls back to the
+    // regular flat-quad path, which at least shows the un-deformed source texture.
+    if (this->m_image.model->puppet.has_value ()) {
+	if (this->initPuppet ()) {
+	    this->m_isPuppet = true;
+	}
+    }
 }
 
 CImage::~CImage () {
@@ -242,6 +286,126 @@ CImage::~CImage () {
     glDeleteBuffers (1, &this->m_passSpacePosition);
     glDeleteBuffers (1, &this->m_texcoordCopy);
     glDeleteBuffers (1, &this->m_texcoordPass);
+
+    if (this->m_puppetVBO) glDeleteBuffers (1, &this->m_puppetVBO);
+    if (this->m_puppetEBO) glDeleteBuffers (1, &this->m_puppetEBO);
+    if (this->m_puppetVAO) glDeleteVertexArrays (1, &this->m_puppetVAO);
+}
+
+bool CImage::initPuppet () {
+    namespace P = WallpaperEngine::Render::Puppet;
+
+    if (!P::MdlParser::parse (
+	    this->getAssetLocator (), *this->m_image.model->puppet, this->m_puppetMdl
+	)) {
+	sLog.error ("Puppet parse failed for image ", this->m_image.id);
+	return false;
+    }
+    if (!this->m_puppetMdl.puppet || this->m_puppetMdl.puppet->bones.empty ()) {
+	sLog.error ("Puppet has no bones for image ", this->m_image.id);
+	return false;
+    }
+
+    // Snapshot the per-image animation layers from the parsed scene description. The struct
+    // field name is `id` even though it stores the JSON `animation` field (= the animation's
+    // own id) — that's the WPE-format quirk reflected throughout the data model.
+    this->m_puppetAnimLayers.clear ();
+    this->m_puppetAnimLayers.reserve (this->m_image.animationLayers.size ());
+    for (const auto& al : this->m_image.animationLayers) {
+	P::PuppetLayer::AnimationLayer layer {};
+	layer.id = al->animation;
+	layer.rate = al->rate;
+	layer.blend = al->blend;
+	layer.visible = al->visible->value->getBool ();
+	layer.curTime = 0.0;
+	this->m_puppetAnimLayers.push_back (layer);
+    }
+
+    this->m_puppetLayer = P::PuppetLayer (this->m_puppetMdl.puppet);
+    this->m_puppetLayer.prepared (this->m_puppetAnimLayers);
+    this->m_boneMatrixUpload.assign (this->m_puppetMdl.puppet->bones.size () * 12, 0.0f);
+
+    // Build interleaved VBO matching WPE's stock vertex layout for skinned meshes:
+    //   [pos.xyz][blend_indices.xyzw uint32][weights.xyzw][uv.xy] = 13 × 4 bytes = 52 bytes.
+    constexpr GLsizei stride = sizeof (float) * (3 + 4 + 4 + 2);
+    const auto& verts = this->m_puppetMdl.vertexs;
+    std::vector<uint8_t> vboBuf (verts.size () * stride);
+    for (size_t i = 0; i < verts.size (); ++i) {
+	uint8_t* dst = vboBuf.data () + i * stride;
+	std::memcpy (dst + 0, verts[i].position.data (), sizeof (float) * 3);
+	std::memcpy (dst + 12, verts[i].blendIndices.data (), sizeof (uint32_t) * 4);
+	std::memcpy (dst + 28, verts[i].weight.data (), sizeof (float) * 4);
+	std::memcpy (dst + 44, verts[i].texcoord.data (), sizeof (float) * 2);
+    }
+
+    // Indices: file is u16 — keep as u16 on GPU too.
+    std::vector<uint16_t> idxBuf;
+    idxBuf.reserve (this->m_puppetMdl.indices.size () * 3);
+    for (const auto& tri : this->m_puppetMdl.indices) {
+	idxBuf.insert (idxBuf.end (), tri.begin (), tri.end ());
+    }
+    this->m_puppetIndexCount = static_cast<GLsizei> (idxBuf.size ());
+
+    GLint prevVAO = 0;
+    glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &prevVAO);
+
+    glGenVertexArrays (1, &this->m_puppetVAO);
+    glBindVertexArray (this->m_puppetVAO);
+
+    glGenBuffers (1, &this->m_puppetVBO);
+    glBindBuffer (GL_ARRAY_BUFFER, this->m_puppetVBO);
+    glBufferData (GL_ARRAY_BUFFER, vboBuf.size (), vboBuf.data (), GL_STATIC_DRAW);
+
+    glGenBuffers (1, &this->m_puppetEBO);
+    glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, this->m_puppetEBO);
+    glBufferData (
+	GL_ELEMENT_ARRAY_BUFFER, idxBuf.size () * sizeof (uint16_t), idxBuf.data (), GL_STATIC_DRAW
+    );
+
+    // Attribute layout follows what stock WPE shaders expect:
+    //   location 0: a_Position (vec3)
+    //   location 1: a_BlendIndices (uvec4)
+    //   location 2: a_BlendWeights (vec4)
+    //   location 3: a_TexCoord (vec2)
+    // CPass currently looks attribute names up via glGetAttribLocation each frame, so the
+    // location numbers below don't have to match — the bindings just need to match positions
+    // in the VBO. We use the same offsets in the geometry-setup callback (where we resolve
+    // the live attribute locations from the linked program).
+    glBindVertexArray (prevVAO);
+
+    // Build the pass override. SKINNING/BONECOUNT enable the stock WPE shader's bone-weighted
+    // vertex transform that the puppet meshes are authored against.
+    this->m_puppetPassOverride = std::make_unique<ImageEffectPassOverride> ();
+    this->m_puppetPassOverride->combos["SKINNING"] = 1;
+    this->m_puppetPassOverride->combos["BONECOUNT"] = static_cast<int> (
+	this->m_puppetMdl.puppet->bones.size ()
+    );
+
+    sLog.out (
+	"Puppet ready for image ", this->m_image.id, ": bones=",
+	this->m_puppetMdl.puppet->bones.size (), " anims=",
+	this->m_puppetMdl.puppet->anims.size (), " verts=", verts.size (),
+	" tris=", this->m_puppetIndexCount / 3
+    );
+    return true;
+}
+
+void CImage::updatePuppetBones () {
+    const double dt = static_cast<double> (g_Time - g_TimeLast);
+
+    auto matrices = this->m_puppetLayer.genFrame (dt);
+
+    // Repack glm::mat4 (16 floats column-major) into mat4x3 layout (12 floats column-major).
+    // That's: for each of 4 columns, take floats [0,1,2] (skip [3]).
+    for (size_t i = 0; i < matrices.size (); ++i) {
+	const float* src = &matrices[i][0][0];
+	float* dst = this->m_boneMatrixUpload.data () + i * 12;
+	for (int col = 0; col < 4; ++col) {
+	    dst[col * 3 + 0] = src[col * 4 + 0];
+	    dst[col * 3 + 1] = src[col * 4 + 1];
+	    dst[col * 3 + 2] = src[col * 4 + 2];
+	}
+    }
 }
 
 void CImage::setup () {
@@ -273,11 +437,147 @@ void CImage::setup () {
 		}
     }
 
-    // copy pass to the composite layer
+    // copy pass to the composite layer. Puppet images get their SKINNING/BONECOUNT combo
+    // override and a geometry callback that binds the skinned VAO + uploads bone matrices.
     for (const auto& cur : this->getImage ().model->material->passes) {
-	this->m_passes.push_back (
-	    new CPass (*this, std::make_shared<FBOProvider> (this), *cur, std::nullopt, std::nullopt, std::nullopt)
+	std::optional<std::reference_wrapper<const ImageEffectPassOverride>> passOverride
+	    = std::nullopt;
+	if (this->m_isPuppet && this->m_puppetPassOverride) {
+	    passOverride = std::cref (*this->m_puppetPassOverride);
+	}
+	auto* pass = new CPass (
+	    *this, std::make_shared<FBOProvider> (this), *cur, passOverride, std::nullopt, std::nullopt
 	);
+	this->m_passes.push_back (pass);
+
+	// Replace the default flat-quad geometry with our skinned mesh.
+	if (this->m_isPuppet) {
+	    // Build BOTH transform candidates up-front; pick which to pin after setupPasses().
+	    //
+	    //  - Image-local: vertex (0,0) → FBO center. Range [-size/2, +size/2] → [0, size].
+	    //    Y-flip converts puppet's Y-down convention into the FBO's Y-up OpenGL
+	    //    convention so the final scene-composite samples it correctly.
+	    //
+	    //  - Scene-space: T(image_origin_scene) × S(scale, -scale, scale). Used only when
+	    //    the puppet pass is also the scene-composite pass (single-pass material with
+	    //    no effects). Y-scale is negated for the same Y-down → Y-up reason.
+	    const glm::vec2 size = this->getSize ();
+	    glm::mat4 mLocal (1.0f);
+	    mLocal = glm::translate (mLocal, glm::vec3 (size.x / 2.0f, size.y / 2.0f, 0.0f));
+	    // Puppet uses Y-down convention (head at smallest Y, feet at largest Y); FBO uses
+	    // OpenGL Y-up. The flip matches the existing copy-pass behaviour (which pairs FBO
+	    // upper-left with V=1) so the deformed image lands in the FBO oriented the same way
+	    // as the un-deformed source — subsequent flat-quad sampling renders right-side-up.
+	    mLocal = glm::scale (mLocal, glm::vec3 (1.0f, -1.0f, 1.0f));
+	    this->m_puppetLocalM = mLocal;
+	    this->m_puppetLocalMVP = this->m_modelViewProjectionCopy * mLocal;
+	    this->m_puppetLocalMVPInverse = glm::inverse (this->m_puppetLocalMVP);
+
+	    const glm::vec3 rawOrigin = this->m_image.origin->value->getVec3 ();
+	    const float canvasW = static_cast<float> (this->getScene ().getCamera ().getWidth ());
+	    const float canvasH = static_cast<float> (this->getScene ().getCamera ().getHeight ());
+	    const glm::vec3 sceneOrigin (
+		rawOrigin.x - canvasW / 2.0f,
+		canvasH / 2.0f - rawOrigin.y,
+		rawOrigin.z
+	    );
+	    const glm::vec3 scale = this->m_image.scale->value->getVec3 ();
+	    glm::mat4 mScene (1.0f);
+	    mScene = glm::translate (mScene, sceneOrigin);
+	    // Same Y-flip rationale as the image-local M above.
+	    mScene = glm::scale (mScene, glm::vec3 (scale.x, -scale.y, scale.z));
+	    this->m_puppetSceneM = mScene;
+	    this->m_puppetSceneVP
+		= this->getScene ().getCamera ().getProjection () * this->getScene ().getCamera ().getLookAt ();
+	    this->m_puppetSceneMVP = this->m_puppetSceneVP * mScene;
+	    this->m_puppetSceneMVPInverse = glm::inverse (this->m_puppetSceneMVP);
+
+	    pass->setGeometryCallback (
+		[this, pass] () {
+		    // Force-disable culling for puppet — these are 2D meshes whose triangle
+		    // winding can be either way, and our M matrix may flip it. Just don't cull.
+		    glDisable (GL_CULL_FACE);
+		    // Clear the destination FBO to transparent black so non-mesh pixels are
+		    // alpha=0. The FBO is created with an opaque-black clear color, and the
+		    // flat-quad copy pass we're replacing would have filled the entire FBO
+		    // with the source texture; without that, un-covered pixels stay opaque
+		    // black and composite over the scene as a visible rectangular box.
+		    GLfloat prevClear[4];
+		    glGetFloatv (GL_COLOR_CLEAR_VALUE, prevClear);
+		    glClearColor (0.0f, 0.0f, 0.0f, 0.0f);
+		    glClear (GL_COLOR_BUFFER_BIT);
+		    glClearColor (prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+		    // Override the pass's blend func with proper alpha compositing for the
+		    // puppet. The default for the first pass is BlendingMode_Normal (GL_ONE,
+		    // GL_ZERO = direct overwrite), which destroys whatever was rendered
+		    // earlier — so an arm triangle drawn after a torso triangle erases the
+		    // torso pixels under the arm's transparent edges. With proper alpha
+		    // blending, a transparent arm edge keeps the torso visible behind it.
+		    //
+		    // The alpha channel uses (GL_ONE, GL_ONE_MINUS_SRC_ALPHA) so the FBO
+		    // accumulates correct edge alpha without double-multiplying when later
+		    // composited into the scene. (Standard SRC_ALPHA blend on alpha would
+		    // shrink edge alpha to alpha² and make outer edges look too transparent
+		    // after the second blend in the scene-composite pass.)
+		    glEnable (GL_BLEND);
+		    glBlendFuncSeparate (
+			GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+			GL_ONE,       GL_ONE_MINUS_SRC_ALPHA
+		    );
+		    glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &this->m_puppetSavedVAO);
+		    glBindVertexArray (this->m_puppetVAO);
+		    this->updatePuppetBones ();
+		    const GLuint program = pass->getProgramID ();
+		    if (program == 0) return;
+		    const GLint loc = glGetUniformLocation (program, "g_Bones");
+		    if (loc >= 0 && !this->m_boneMatrixUpload.empty ()) {
+			glUniformMatrix4x3fv (
+			    loc, static_cast<GLsizei> (this->m_boneMatrixUpload.size () / 12),
+			    GL_FALSE, this->m_boneMatrixUpload.data ()
+			);
+		    }
+		    // Re-bind the per-vertex attributes from our interleaved VBO. Stride 52,
+		    // matching the layout we built in initPuppet().
+		    constexpr GLsizei stride = sizeof (float) * (3 + 4 + 4 + 2);
+		    const GLint posLoc = glGetAttribLocation (program, "a_Position");
+		    const GLint biLoc = glGetAttribLocation (program, "a_BlendIndices");
+		    const GLint bwLoc = glGetAttribLocation (program, "a_BlendWeights");
+		    const GLint tcLoc = glGetAttribLocation (program, "a_TexCoord");
+		    glBindBuffer (GL_ARRAY_BUFFER, this->m_puppetVBO);
+		    glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, this->m_puppetEBO);
+		    if (posLoc >= 0) {
+			glEnableVertexAttribArray (posLoc);
+			glVertexAttribPointer (
+			    posLoc, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*> (0)
+			);
+		    }
+		    if (biLoc >= 0) {
+			glEnableVertexAttribArray (biLoc);
+			glVertexAttribIPointer (
+			    biLoc, 4, GL_UNSIGNED_INT, stride, reinterpret_cast<void*> (12)
+			);
+		    }
+		    if (bwLoc >= 0) {
+			glEnableVertexAttribArray (bwLoc);
+			glVertexAttribPointer (
+			    bwLoc, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*> (28)
+			);
+		    }
+		    if (tcLoc >= 0) {
+			glEnableVertexAttribArray (tcLoc);
+			glVertexAttribPointer (
+			    tcLoc, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*> (44)
+			);
+		    }
+		},
+		[this] () {
+		    glDrawElements (
+			GL_TRIANGLES, this->m_puppetIndexCount, GL_UNSIGNED_SHORT, nullptr
+		    );
+		},
+		[this] () { glBindVertexArray (this->m_puppetSavedVAO); }
+	    );
+	}
     }
 
     // prepare the passes list
@@ -395,6 +695,28 @@ void CImage::setup () {
     CRenderable::setup ();
 
     this->setupPasses ();
+
+    // setupPasses() pinned each pass's matrix pointers to CImage's flat-quad matrices.
+    // Re-pin the FIRST puppet pass with the appropriate transform:
+    //   - If it's the only pass (no effects), it draws direct to scene → use scene-space M.
+    //   - If there are effects, it draws to the image FBO → use image-local M, and the
+    //     existing pipeline handles scene-composite via the final pass.
+    if (this->m_isPuppet && !this->m_passes.empty ()) {
+	auto* p = this->m_passes.front ();
+	const bool singlePass = (this->m_passes.size () == 1);
+	if (singlePass) {
+	    p->setModelMatrix (&this->m_puppetSceneM);
+	    p->setViewProjectionMatrix (&this->m_puppetSceneVP);
+	    p->setModelViewProjectionMatrix (&this->m_puppetSceneMVP);
+	    p->setModelViewProjectionMatrixInverse (&this->m_puppetSceneMVPInverse);
+	} else {
+	    p->setModelMatrix (&this->m_puppetLocalM);
+	    p->setViewProjectionMatrix (&this->m_modelViewProjectionCopy);
+	    p->setModelViewProjectionMatrix (&this->m_puppetLocalMVP);
+	    p->setModelViewProjectionMatrixInverse (&this->m_puppetLocalMVPInverse);
+	}
+    }
+
     this->m_initialized = true;
 }
 
@@ -558,7 +880,7 @@ void CImage::updateScreenSpacePosition () {
 	const glm::vec2 depth = this->getImage ().parallaxDepth->value->getVec2 ();
 	const glm::vec2* displacement = this->getScene ().getParallaxDisplacement ();
 	float x = (depth.x + parallaxAmount) * displacement->x * this->getSize ().x;
-	float y = (depth.y + parallaxAmount) * displacement->y * this->getSize ().x;
+	float y = (depth.y + parallaxAmount) * displacement->y * this->getSize ().y;
 	mvp = glm::translate (mvp, { x, y, 0.0f });
     }
 

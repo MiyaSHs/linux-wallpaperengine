@@ -61,3 +61,7 @@ void CVideo::setPause (bool newState) {
 int CVideo::getWidth () const { return this->m_player ? this->m_player->getWidth () : 16; }
 
 int CVideo::getHeight () const { return this->m_player ? this->m_player->getHeight () : 16; }
+
+bool CVideo::isReadyForScreenshot () const {
+    return this->m_player && this->m_player->hasRenderedFrame ();
+}
