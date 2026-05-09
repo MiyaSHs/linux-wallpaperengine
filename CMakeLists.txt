@@ -369,6 +369,11 @@ set(COMMON_SOURCES
     src/WallpaperEngine/Render/FBOProvider.cpp
     src/WallpaperEngine/Render/FBOProvider.h
 
+    src/WallpaperEngine/Render/Puppet/Puppet.h
+    src/WallpaperEngine/Render/Puppet/Puppet.cpp
+    src/WallpaperEngine/Render/Puppet/MdlParser.h
+    src/WallpaperEngine/Render/Puppet/MdlParser.cpp
+
     src/WallpaperEngine/Render/Helpers/ContextAware.cpp
     src/WallpaperEngine/Render/Helpers/ContextAware.h
 
